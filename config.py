@@ -58,7 +58,9 @@ FIREBASE_KEY_PATH: Path = Path(os.getenv("FIREBASE_KEY_PATH", ""))
 
 # ── STT / TTS ─────────────────────────────────────────────
 STT_MODEL: str = os.getenv("STT_MODEL", "base")
-TTS_MODEL: str = os.getenv("TTS_MODEL", "kokoro")
+TTS_MODEL: str = os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
+XTTS_REF_AUDIO_DIR: Path = Path(os.getenv("XTTS_REF_AUDIO_DIR", str(BASE_DIR / "sound_model")))
+XTTS_LANGUAGE: str = os.getenv("XTTS_LANGUAGE", "ko")
 
 # ── 로그 ──────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG" if not IS_MAC else "INFO")

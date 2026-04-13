@@ -99,6 +99,15 @@ def _init_character() -> None:
         _vts_connected = False
 
 
+def _init_tts() -> None:
+    """GPT-SoVITS 가중치를 API 서버에 로드한다."""
+    try:
+        tts.load_models()
+        logger.info("TTS 모델 로드 완료")
+    except Exception as e:
+        logger.warning("TTS 모델 로드 실패 (TTS 비활성화될 수 있음): {e}", e=e)
+
+
 def _init_models() -> None:
     """감정·기억 모델을 미리 로드해 첫 발화 지연과 초기화 오류를 방지한다."""
     try:
@@ -356,6 +365,7 @@ def main(text_mode: bool = False) -> None:
     # ── 모듈 초기화 ────────────────────────────────────────
     if not text_mode:
         _init_stt()
+    _init_tts()
     _init_models()
     _init_character()
     _init_scheduler()
