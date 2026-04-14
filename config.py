@@ -62,6 +62,16 @@ TTS_MODEL: str = os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/x
 XTTS_REF_AUDIO_DIR: Path = Path(os.getenv("XTTS_REF_AUDIO_DIR", str(BASE_DIR / "sound_model")))
 XTTS_LANGUAGE: str = os.getenv("XTTS_LANGUAGE", "ko")
 
+# ── GPT-SoVITS ────────────────────────────────────────────
+_default_sovits_dir = str(BASE_DIR.parent / "GPT-SoVITS" / "GPT-SoVITS-v2pro-20250604-nvidia50")
+SOVITS_DIR: Path = Path(os.getenv("SOVITS_DIR", _default_sovits_dir))
+SOVITS_API_URL: str = os.getenv("SOVITS_API_URL", "http://127.0.0.1:9880")
+SOVITS_REF_AUDIO: Path = Path(os.getenv("SOVITS_REF_AUDIO", str(BASE_DIR / "sound_model" / "segment_0000.wav")))
+SOVITS_REF_TEXT: str = os.getenv("SOVITS_REF_TEXT", "")
+SOVITS_LANG: str = os.getenv("SOVITS_LANG", "ko")
+SOVITS_GPT_WEIGHTS: str = os.getenv("SOVITS_GPT_WEIGHTS", "GPT_weights_v2Pro/ria-e10.ckpt")
+SOVITS_WEIGHTS: str = os.getenv("SOVITS_WEIGHTS", "SoVITS_weights_v2Pro/ria_e8_s360.pth")
+
 # ── 로그 ──────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG" if not IS_MAC else "INFO")
 LOG_DIR: Path = BASE_DIR / "logs"

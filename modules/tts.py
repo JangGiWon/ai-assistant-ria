@@ -1,193 +1,362 @@
 """
-modules/tts.py — 텍스트 → 음성 (Coqui XTTS v2 + pygame)
+modules/tts.py — 텍스트 → 음성 (GPT-SoVITS 스트리밍 API + sounddevice)
 
-Coqui XTTS v2 모델을 로컬에서 실행하여 wav를 합성하고,
-pygame.mixer로 재생한다.
+GPT-SoVITS api_v2.py 서버에 streaming_mode=True 로 요청하고
+sounddevice로 청크 단위 실시간 재생한다.
 
-첫 실행 시 모델이 자동 다운로드된다 (~2GB).
-XTTS_REF_AUDIO_DIR 내 모든 wav를 레퍼런스로 사용해 음성 클로닝을 수행한다.
+서버가 꺼져 있으면 SOVITS_DIR/runtime/python.exe 로 자동 기동한다.
 
 실행:
     python modules/tts.py
 """
-import os
+import io
+import struct
+import subprocess
+import threading
+import time
 import wave
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator
 
-import pygame
+import numpy as np
+import requests
+import sounddevice as sd
 from loguru import logger
 
-from config import BASE_DIR, DEVICE, TTS_MODEL, XTTS_LANGUAGE, XTTS_REF_AUDIO_DIR
+from config import (
+    BASE_DIR,
+    SOVITS_API_URL,
+    SOVITS_DIR,
+    SOVITS_GPT_WEIGHTS,
+    SOVITS_LANG,
+    SOVITS_REF_AUDIO,
+    SOVITS_REF_TEXT,
+    SOVITS_WEIGHTS,
+)
 
 # ── 설정 ─────────────────────────────────────────────────
-_DEFAULT_OUTPUT: Path = BASE_DIR / "temp_tts.wav"
-
-# 싱글턴 TTS 엔진
-_tts_engine: Optional[object] = None
+_SERVER_STARTUP_TIMEOUT: int = 90   # 서버 기동 대기 최대 초
+_SERVER_POLL_INTERVAL: float = 1.5  # 폴링 간격 (초)
 
 
-def _get_ref_audio_list() -> List[str]:
-    """XTTS_REF_AUDIO_DIR 내 모든 wav 파일 경로를 반환한다."""
-    wavs = sorted(XTTS_REF_AUDIO_DIR.glob("*.wav"))
-    # 백업 파일 제외
-    wavs = [w for w in wavs if "backup" not in w.name]
-    if not wavs:
-        raise FileNotFoundError(f"레퍼런스 오디오가 없습니다: {XTTS_REF_AUDIO_DIR}")
-    logger.debug("레퍼런스 오디오 {n}개 사용 | dir={d}", n=len(wavs), d=XTTS_REF_AUDIO_DIR)
-    return [str(w) for w in wavs]
+# ── 서버 관리 ─────────────────────────────────────────────
+
+def _is_server_alive() -> bool:
+    """GPT-SoVITS API 서버가 응답 중인지 확인한다."""
+    try:
+        resp = requests.get(f"{SOVITS_API_URL}/", timeout=2)
+        return resp.status_code < 500
+    except requests.exceptions.ConnectionError:
+        return False
+    except Exception:
+        return False
 
 
-# ── 모델 로드 ─────────────────────────────────────────────
+def _start_server() -> subprocess.Popen:
+    """GPT-SoVITS api_v2.py 서버를 백그라운드로 기동한다.
 
-def load_models() -> None:
-    """Coqui XTTS v2 모델을 로드한다. 앱 시작 시 1회 호출.
-
-    첫 실행 시 모델을 자동 다운로드한다 (~2GB).
+    Returns:
+        기동된 서버 프로세스
 
     Raises:
-        RuntimeError: 모델 로드 실패 시
+        FileNotFoundError: SOVITS_DIR 가 존재하지 않을 경우
     """
-    global _tts_engine
-    if _tts_engine is not None:
-        logger.debug("TTS 모델 이미 로드됨, 스킵")
-        return
+    if not SOVITS_DIR.exists():
+        raise FileNotFoundError(f"GPT-SoVITS 디렉터리를 찾을 수 없습니다: {SOVITS_DIR}")
 
-    try:
-        os.environ["COQUI_TOS_AGREED"] = "1"  # 비상업적 CPML 라이선스 동의
-        from TTS.api import TTS  # type: ignore[import]
-        logger.info("XTTS v2 모델 로드 중 | model={m} | device={d}", m=TTS_MODEL, d=DEVICE)
-        _tts_engine = TTS(model_name=TTS_MODEL, progress_bar=True).to(DEVICE)
-        logger.info("XTTS v2 모델 로드 완료")
-    except Exception as e:
-        raise RuntimeError(f"XTTS v2 모델 로드 실패: {e}") from e
+    runtime_python = SOVITS_DIR / "runtime" / "python.exe"
+    python_exe = str(runtime_python) if runtime_python.exists() else "python"
 
+    inner_cmd = f'$env:PYTHONIOENCODING="utf-8"; cd "{SOVITS_DIR}"; & "{python_exe}" api_v2.py -a 127.0.0.1 -p 9880'
+    cmd = ["powershell", "-NoExit", "-Command", inner_cmd]
 
-def _get_engine() -> object:
-    """TTS 엔진 싱글턴을 반환한다. 미로드 시 자동 로드."""
-    if _tts_engine is None:
-        load_models()
-    return _tts_engine
+    logger.info("GPT-SoVITS 서버 기동 (새 PowerShell 창) | dir={d}", d=SOVITS_DIR)
+
+    proc = subprocess.Popen(
+        cmd,
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+    return proc
 
 
-# ── 합성 ──────────────────────────────────────────────────
+def _wait_for_server(timeout: int = _SERVER_STARTUP_TIMEOUT) -> None:
+    """서버가 준비될 때까지 최대 timeout초 폴링 대기한다.
 
-def synthesize(
-    text: str,
-    output_path: Optional[Path] = None,
-) -> Path:
-    """XTTS v2로 텍스트를 wav 파일로 합성한다.
+    Raises:
+        TimeoutError: timeout 내에 서버가 응답하지 않을 경우
+    """
+    logger.info("GPT-SoVITS 모델 로딩 대기 중... (최대 {t}초)", t=timeout)
+    # 서버 프로세스가 HTTP 바인딩하기 전에 폴링하지 않도록 초기 대기
+    time.sleep(5)
 
-    XTTS_REF_AUDIO_DIR 내 모든 wav를 레퍼런스로 사용해 음성 클로닝을 수행한다.
+    start = time.time()
+    last_log = start
+    deadline = start + timeout
+
+    while time.time() < deadline:
+        if _is_server_alive():
+            elapsed = int(time.time() - start)
+            logger.info("GPT-SoVITS 서버 준비 완료 | 소요={e}초", e=elapsed)
+            return
+
+        now = time.time()
+        if now - last_log >= 10:
+            elapsed = int(now - start)
+            logger.info("GPT-SoVITS 기동 대기 중... {e}초 경과 / {t}초", e=elapsed, t=timeout)
+            last_log = now
+
+        time.sleep(_SERVER_POLL_INTERVAL)
+
+    raise TimeoutError(f"GPT-SoVITS 서버가 {timeout}초 내에 응답하지 않습니다.")
+
+
+def _load_weights() -> None:
+    """GPT 및 SoVITS 가중치를 API에 로드한다.
+
+    Raises:
+        RuntimeError: 가중치 로드 API 호출 실패 시
+    """
+    for endpoint, weights, label in [
+        ("/set_gpt_weights", SOVITS_GPT_WEIGHTS, "GPT"),
+        ("/set_sovits_weights", SOVITS_WEIGHTS, "SoVITS"),
+    ]:
+        try:
+            resp = requests.get(
+                f"{SOVITS_API_URL}{endpoint}",
+                params={"weights_path": weights},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"{label} 가중치 로드 실패 {resp.status_code}: {resp.text[:200]}")
+            logger.info("{label} 가중치 로드 완료 | {w}", label=label, w=weights)
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"{label} 가중치 로드 요청 실패: {e}") from e
+
+
+_weights_loaded = False
+
+
+def ensure_server() -> None:
+    """서버가 꺼져 있으면 자동 기동하고, 가중치를 최초 1회만 로드한다."""
+    global _weights_loaded
+    if _is_server_alive():
+        logger.debug("GPT-SoVITS 서버 이미 실행 중")
+    else:
+        logger.warning("GPT-SoVITS 서버 미기동 — 자동 시작합니다")
+        _start_server()
+        _wait_for_server()
+        _weights_loaded = False
+
+    if not _weights_loaded:
+        _load_weights()
+        _weights_loaded = True
+
+
+# ── 레퍼런스 캐시 ─────────────────────────────────────────
+
+_ref_cache: dict | None = None
+
+
+def _get_refs() -> tuple[str, list[str]]:
+    """레퍼런스 파일 경로를 반환한다. SOVITS_REF_AUDIO 고정 사용."""
+    global _ref_cache
+    if _ref_cache is None:
+        _ref_cache = {"main": str(SOVITS_REF_AUDIO), "aux": []}
+    return _ref_cache["main"], _ref_cache["aux"]
+
+
+# ── 합성 (스트리밍) ───────────────────────────────────────
+
+def synthesize_stream(text: str) -> requests.Response:
+    """GPT-SoVITS API에 스트리밍 모드로 합성을 요청하고, 스트림 응답을 반환한다.
 
     Args:
         text: 합성할 텍스트 (빈 문자열 불가)
-        output_path: 저장 경로. None이면 BASE_DIR/temp_tts.wav 사용
 
     Returns:
-        저장된 wav 파일의 Path
+        스트리밍 응답 (iter_content로 청크 순회 가능)
 
     Raises:
         ValueError: text가 비어 있거나 공백만인 경우
-        FileNotFoundError: 레퍼런스 오디오 파일이 없는 경우
-        RuntimeError: 합성 실패 시
+        RuntimeError: API 호출 실패 시
     """
     if not text or not text.strip():
         raise ValueError("합성할 텍스트가 비어 있습니다.")
 
-    ref_audios = _get_ref_audio_list()
-    dest: Path = output_path if output_path is not None else _DEFAULT_OUTPUT
+    ref_main, aux_refs = _get_refs()
+
+    payload = {
+        "text": text,
+        "text_lang": SOVITS_LANG,
+        "ref_audio_path": ref_main,
+        "aux_ref_audio_paths": aux_refs,
+        "prompt_text": SOVITS_REF_TEXT,
+        "prompt_lang": SOVITS_LANG,
+        "text_split_method": "cut0",
+        "batch_size": 1,
+        "media_type": "wav",
+        "streaming_mode": 2,
+    }
 
     logger.debug(
-        "TTS 합성 시작 | text_len={n} | lang={lang} | ref={r}개 | dest={dest}",
+        "TTS 스트리밍 합성 요청 | text_len={n} | endpoint={url}",
         n=len(text),
-        lang=XTTS_LANGUAGE,
-        r=len(ref_audios),
-        dest=dest,
+        url=f"{SOVITS_API_URL}/tts",
     )
 
     try:
-        engine = _get_engine()
-        engine.tts_to_file(  # type: ignore[union-attr]
-            text=text,
-            speaker_wav=ref_audios,
-            language=XTTS_LANGUAGE,
-            file_path=str(dest),
-            temperature=0.75,
-            repetition_penalty=2.0,
-            top_k=50,
-            top_p=0.85,
-            speed=1.0,
+        resp = requests.post(
+            f"{SOVITS_API_URL}/tts",
+            json=payload,
+            timeout=120,
+            stream=True,
         )
-    except Exception as e:
-        raise RuntimeError(f"XTTS v2 합성 오류: {e}") from e
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"GPT-SoVITS API 요청 실패: {e}") from e
 
-    logger.info("TTS 합성 완료 | dest={dest}", dest=dest)
-    return dest
+    if resp.status_code != 200:
+        raise RuntimeError(f"API 오류 {resp.status_code}: {resp.text[:300]}")
 
-
-# ── 재생 ──────────────────────────────────────────────────
-
-def _read_wav_params(file_path: Path) -> tuple[int, int, int]:
-    """wav 파일의 (샘플레이트, 채널 수, sampwidth)를 반환한다."""
-    with wave.open(str(file_path), "rb") as wf:
-        return wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+    return resp
 
 
-def play(file_path: Path) -> None:
-    """wav 파일을 pygame.mixer로 재생한다. 재생 완료까지 블로킹.
+# ── WAV 스트림 파싱 ───────────────────────────────────────
 
-    Args:
-        file_path: 재생할 wav 파일 경로
+_WAV_HEADER_SIZE = 44
 
-    Raises:
-        FileNotFoundError: 파일이 존재하지 않을 경우
-        RuntimeError: pygame 초기화 또는 재생 오류 시
+
+def _parse_wav_header(header: bytes) -> tuple[int, int, int]:
+    """44-byte WAV 헤더에서 sample_rate, channels, sample_width(bytes)를 추출한다."""
+    channels = struct.unpack_from("<H", header, 22)[0]
+    sample_rate = struct.unpack_from("<I", header, 24)[0]
+    bits_per_sample = struct.unpack_from("<H", header, 34)[0]
+    return sample_rate, channels, bits_per_sample // 8
+
+
+def _iter_pcm_chunks(
+    resp: requests.Response,
+    chunk_size: int = 8192,
+) -> Iterator[tuple[bytes, int, int, int]]:
+    """스트리밍 응답에서 PCM 데이터를 청크 단위로 yield한다.
+
+    GPT-SoVITS 스트리밍은 첫 44바이트가 WAV 헤더이고,
+    이후 모든 데이터는 raw PCM이다.
+
+    Yields:
+        (pcm_data, sample_rate, channels, sample_width)
     """
-    if not file_path.exists():
-        raise FileNotFoundError(f"재생 파일이 없습니다: {file_path}")
-
-    sample_rate, channels, sampwidth = _read_wav_params(file_path)
-    bit_depth = sampwidth * 8
-    logger.debug(
-        "오디오 재생 시작 | file={file} | {hz}Hz | {ch}ch | {bit}bit",
-        file=file_path,
-        hz=sample_rate,
-        ch=channels,
-        bit=bit_depth,
-    )
+    header_buf = b""
+    sample_rate = channels = sample_width = 0
+    header_parsed = False
 
     try:
-        size = -(sampwidth * 8) if sampwidth > 1 else sampwidth * 8
-        pygame.mixer.init(frequency=sample_rate, size=size, channels=channels)
-        pygame.mixer.music.load(str(file_path))
-        pygame.mixer.music.set_volume(0.6)
-        pygame.mixer.music.play()
+        for raw_chunk in resp.iter_content(chunk_size=chunk_size):
+            if not raw_chunk:
+                continue
 
-        clock = pygame.time.Clock()
-        while pygame.mixer.music.get_busy():
-            clock.tick(10)
+            if not header_parsed:
+                header_buf += raw_chunk
+                if len(header_buf) < _WAV_HEADER_SIZE:
+                    continue
 
-        logger.info("오디오 재생 완료 | file={file}", file=file_path)
-    except Exception as e:
-        raise RuntimeError(f"pygame 재생 오류: {e}") from e
-    finally:
-        _safe_mixer_quit()
+                sample_rate, channels, sample_width = _parse_wav_header(header_buf[:_WAV_HEADER_SIZE])
+                header_parsed = True
+                logger.debug(
+                    "오디오 포맷 감지 | rate={r} ch={c} width={w}",
+                    r=sample_rate, c=channels, w=sample_width,
+                )
+
+                leftover = header_buf[_WAV_HEADER_SIZE:]
+                if leftover:
+                    yield leftover, sample_rate, channels, sample_width
+            else:
+                yield raw_chunk, sample_rate, channels, sample_width
+
+    except requests.exceptions.ChunkedEncodingError:
+        logger.debug("스트림 종료 (ChunkedEncodingError)")
 
 
-def _safe_mixer_quit() -> None:
-    """pygame.mixer가 초기화된 경우에만 종료한다."""
-    try:
-        if pygame.mixer.get_init():
-            pygame.mixer.quit()
-    except Exception as e:
-        logger.warning("pygame.mixer 종료 중 오류 (무시): {e}", e=e)
+# ── 재생 (스트리밍) ───────────────────────────────────────
+
+class StreamingPlayer:
+    """스트리밍 응답을 받아 실시간으로 재생하는 플레이어.
+
+    사용법:
+        player = StreamingPlayer()
+        player.play(response)   # 블로킹 (재생 완료까지)
+        player.stop()           # 다른 스레드에서 호출하여 즉시 중단
+    """
+
+    def __init__(self) -> None:
+        self._stop_event = threading.Event()
+        self._stream: sd.RawOutputStream | None = None
+
+    def stop(self) -> None:
+        """재생을 즉시 중단한다."""
+        self._stop_event.set()
+        if self._stream is not None:
+            self._stream.abort()
+        logger.info("재생 중단 요청됨")
+
+    def play(self, resp: requests.Response) -> None:
+        """스트리밍 응답을 청크 단위로 수신하며 실시간 재생한다.
+
+        Args:
+            resp: synthesize_stream()이 반환한 스트리밍 응답
+        """
+        self._stop_event.clear()
+        self._stream = None
+        total_bytes = 0
+        dtype_map = {1: "int8", 2: "int16", 4: "int32"}
+
+        try:
+            for pcm, sr, ch, sw in _iter_pcm_chunks(resp):
+                if self._stop_event.is_set():
+                    break
+
+                if self._stream is None:
+                    dtype = dtype_map.get(sw, "int16")
+                    self._stream = sd.RawOutputStream(
+                        samplerate=sr,
+                        channels=ch,
+                        dtype=dtype,
+                    )
+                    self._stream.start()
+                    logger.debug("sounddevice 스트림 시작 | rate={r} ch={c} dtype={d}", r=sr, c=ch, d=dtype)
+
+                self._stream.write(pcm)
+                total_bytes += len(pcm)
+
+        except Exception as e:
+            if not self._stop_event.is_set():
+                raise RuntimeError(f"스트리밍 재생 오류: {e}") from e
+        finally:
+            if self._stream is not None:
+                if not self._stop_event.is_set():
+                    self._stream.stop()
+                self._stream.close()
+                self._stream = None
+
+        logger.info("스트리밍 재생 완료 | total_pcm={s}B", s=total_bytes)
+
+
+# ── 전역 플레이어 (stop 접근용) ──────────────────────────
+
+_player = StreamingPlayer()
+
+
+def stop() -> None:
+    """현재 재생 중인 음성을 즉시 중단한다."""
+    _player.stop()
 
 
 # ── 통합 인터페이스 ───────────────────────────────────────
 
 def speak(text: str) -> None:
-    """텍스트를 합성 후 재생한다. 재생 완료 후 임시 파일을 삭제한다.
+    """텍스트를 스트리밍으로 합성하면서 실시간 재생한다.
+
+    서버가 꺼져 있으면 자동 기동한다.
+    다른 스레드에서 stop()을 호출하면 재생을 즉시 중단할 수 있다.
 
     Args:
         text: 읽을 텍스트
@@ -195,69 +364,57 @@ def speak(text: str) -> None:
     Raises:
         ValueError: text가 비어 있거나 공백만인 경우
     """
-    wav_path = synthesize(text)
-    try:
-        play(wav_path)
-    finally:
-        _cleanup_temp_file(wav_path)
-
-
-def _cleanup_temp_file(file_path: Path) -> None:
-    """임시 파일을 삭제한다. 삭제 실패 시 경고만 기록하고 진행한다."""
-    try:
-        if file_path.exists():
-            file_path.unlink()
-            logger.debug("임시 파일 삭제 | file={file}", file=file_path)
-    except Exception as e:
-        logger.warning("임시 파일 삭제 실패 (무시): {file} | {e}", file=file_path, e=e)
+    ensure_server()
+    resp = synthesize_stream(text)
+    _player.play(resp)
 
 
 # ── 단독 테스트 ───────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info("=== tts.py 단독 테스트 시작 ===")
+    logger.info("=== tts.py 스트리밍 테스트 시작 ===")
 
-    # ── 정상 케이스 1: 모델 로드 ──────────────────────────
-    logger.info("--- 정상 케이스 1: load_models() ---")
+    # ── 서버 확인/자동 기동 ───────────────────────────────
+    logger.info("--- 케이스 1: ensure_server() ---")
     try:
-        load_models()
-        logger.info("정상 케이스 1 통과")
+        ensure_server()
+        logger.info("케이스 1 통과")
     except Exception as e:
-        logger.error("정상 케이스 1 실패: {e}", e=e)
+        logger.error("케이스 1 실패: {e}", e=e)
 
-    # ── 정상 케이스 2: 음성 합성 + 재생 ──────────────────
-    logger.info("--- 정상 케이스 2: speak('안녕하세요, 저는 리아입니다.') ---")
+    # ── 스트리밍 합성 + 실시간 재생 ──────────────────────
+    logger.info("--- 케이스 2: speak() 스트리밍 재생 ---")
     try:
-        speak("안녕하세요, 저는 리아입니다.")
-        logger.info("정상 케이스 2 통과")
+        t0 = time.time()
+        speak("안녕하세요, 저는 리아입니다. 스트리밍 모드로 실시간 재생하고 있어요.")
+        elapsed = time.time() - t0
+        logger.info("케이스 2 통과 | 소요={e:.1f}초", e=elapsed)
     except Exception as e:
-        logger.error("정상 케이스 2 실패: {e}", e=e)
+        logger.error("케이스 2 실패: {e}", e=e)
 
-    # ── 에러 케이스 1: 빈 문자열 ──────────────────────────
-    logger.info("--- 에러 케이스 1: 빈 문자열 ---")
+    # ── 빈 문자열 에러 처리 ──────────────────────────────
+    logger.info("--- 케이스 3: 빈 문자열 ---")
     try:
         speak("")
-        logger.warning("에러 케이스 1: 예외가 발생해야 하는데 통과됨")
+        logger.warning("케이스 3: 예외가 발생해야 하는데 통과됨")
     except ValueError as e:
-        logger.info("에러 케이스 1 정상 처리: {e}", e=e)
+        logger.info("케이스 3 정상 처리: {e}", e=e)
 
-    # ── 에러 케이스 2: 레퍼런스 오디오 디렉토리 비어 있음 ──
-    logger.info("--- 에러 케이스 2: 레퍼런스 오디오 없음 ---")
-    import os
-    _orig = os.environ.get("XTTS_REF_AUDIO_DIR")
-    os.environ["XTTS_REF_AUDIO_DIR"] = "/nonexistent/dir"
+    # ── stop() 중단 테스트 ───────────────────────────────
+    logger.info("--- 케이스 4: stop() 1초 후 중단 ---")
     try:
-        from pathlib import Path as _Path
-        wavs = list(_Path("/nonexistent/dir").glob("*.wav")) if _Path("/nonexistent/dir").exists() else []
-        if not wavs:
-            raise FileNotFoundError("레퍼런스 오디오가 없습니다: /nonexistent/dir")
-        logger.warning("에러 케이스 2: 예외가 발생해야 하는데 통과됨")
-    except FileNotFoundError as e:
-        logger.info("에러 케이스 2 정상 처리: {e}", e=e)
-    finally:
-        if _orig is None:
-            os.environ.pop("XTTS_REF_AUDIO_DIR", None)
-        else:
-            os.environ["XTTS_REF_AUDIO_DIR"] = _orig
+        def _stop_after(sec: float) -> None:
+            time.sleep(sec)
+            stop()
 
-    logger.info("=== tts.py 단독 테스트 완료 ===")
+        timer = threading.Thread(target=_stop_after, args=(1.0,))
+        timer.start()
+        t0 = time.time()
+        speak("이 문장은 중간에 잘릴 수 있습니다. 왜냐하면 1초 후에 stop이 호출되기 때문이에요.")
+        elapsed = time.time() - t0
+        timer.join()
+        logger.info("케이스 4 통과 | 소요={e:.1f}초 (1초 근처면 정상 중단)", e=elapsed)
+    except Exception as e:
+        logger.error("케이스 4 실패: {e}", e=e)
+
+    logger.info("=== tts.py 스트리밍 테스트 완료 ===")
