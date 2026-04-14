@@ -79,12 +79,6 @@ SOVITS_WEIGHTS: str = os.getenv(
     str(SOVITS_DIR / "GPT_SoVITS" / "pretrained_models"
         / "gsv-v2final-pretrained" / "s2G2333k.pth"),
 )
-    str(SOVITS_DIR / "GPT_SoVITS" / "pretrained_models" / "gsv-v2final-pretrained" / "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"),
-)
-SOVITS_WEIGHTS: str = os.getenv(
-    "SOVITS_WEIGHTS",
-    str(SOVITS_DIR / "GPT_SoVITS" / "pretrained_models" / "gsv-v2final-pretrained" / "s2G2333k.pth"),
-)
 
 # ── Obsidian ──────────────────────────────────────────────
 if IS_WINDOWS:
