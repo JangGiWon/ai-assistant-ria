@@ -78,6 +78,13 @@ SOVITS_WEIGHTS: str = os.getenv(
     str(SOVITS_DIR / "GPT_SoVITS" / "pretrained_models" / "gsv-v2final-pretrained" / "s2G2333k.pth"),
 )
 
+# ── Obsidian ──────────────────────────────────────────────
+if IS_WINDOWS:
+    _default_obsidian = r"C:\Users\user\Documents\Obsidian Vault"
+else:
+    _default_obsidian = str(Path.home() / "Documents" / "Obsidian Vault")
+OBSIDIAN_VAULT_PATH: Path = Path(os.getenv("OBSIDIAN_VAULT_PATH", _default_obsidian))
+
 # ── 로그 ──────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG" if not IS_MAC else "INFO")
 LOG_DIR: Path = BASE_DIR / "logs"
