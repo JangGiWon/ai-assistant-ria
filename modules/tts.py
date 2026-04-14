@@ -67,10 +67,15 @@ def _start_server() -> subprocess.Popen:
     runtime_python = SOVITS_DIR / "runtime" / "python.exe"
     python_exe = str(runtime_python) if runtime_python.exists() else "python"
 
-    inner_cmd = f'$env:PYTHONIOENCODING="utf-8"; cd "{SOVITS_DIR}"; & "{python_exe}" api_v2.py -a 127.0.0.1 -p 9880'
+    log_path = SOVITS_DIR / "api_v2.log"
+    inner_cmd = (
+        f'$env:PYTHONIOENCODING="utf-8"; '
+        f'cd "{SOVITS_DIR}"; '
+        f'& "{python_exe}" api_v2.py -a 127.0.0.1 -p 9880 *>> "{log_path}" 2>&1'
+    )
     cmd = ["powershell", "-NoExit", "-Command", inner_cmd]
 
-    logger.info("GPT-SoVITS 서버 기동 (새 PowerShell 창) | dir={d}", d=SOVITS_DIR)
+    logger.info("GPT-SoVITS 서버 기동 | log={log}", log=log_path)
 
     proc = subprocess.Popen(
         cmd,
@@ -284,8 +289,8 @@ def _iter_pcm_chunks(
             else:
                 yield raw_chunk, sample_rate, channels, sample_width
 
-    except requests.exceptions.ChunkedEncodingError:
-        logger.debug("스트림 종료 (ChunkedEncodingError)")
+    except requests.exceptions.ChunkedEncodingError as e:
+        logger.warning("ChunkedEncodingError: {e}", e=e)
 
 
 # ── 재생 (스트리밍) ───────────────────────────────────────
@@ -350,45 +355,6 @@ class StreamingPlayer:
                 self._stream = None
 
         logger.info("스트리밍 재생 완료 | total_pcm={s}B", s=total_bytes)
-        return total_bytes
-
-    def play_wav(self, wav_bytes: bytes) -> None:
-        """완성된 WAV bytes를 sounddevice로 재생한다 (비스트리밍 폴백용)."""
-        self._stop_event.clear()
-        self._stream = None
-
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-            sr = wf.getframerate()
-            ch = wf.getnchannels()
-            sw = wf.getsampwidth()
-            pcm_data = wf.readframes(wf.getnframes())
-
-        dtype_map = {1: "int8", 2: "int16", 4: "int32"}
-        dtype = dtype_map.get(sw, "int16")
-        chunk_size = sr * sw * ch  # 1초 분량씩
-        offset = 0
-
-        try:
-            self._stream = sd.RawOutputStream(samplerate=sr, channels=ch, dtype=dtype)
-            self._stream.start()
-            logger.debug("폴백 재생 시작 | rate={r} ch={c} dtype={d}", r=sr, c=ch, d=dtype)
-            while offset < len(pcm_data):
-                if self._stop_event.is_set():
-                    break
-                chunk = pcm_data[offset:offset + chunk_size]
-                self._stream.write(chunk)
-                offset += len(chunk)
-        except Exception as e:
-            if not self._stop_event.is_set():
-                raise RuntimeError(f"폴백 재생 오류: {e}") from e
-        finally:
-            if self._stream is not None:
-                if not self._stop_event.is_set():
-                    self._stream.stop()
-                self._stream.close()
-                self._stream = None
-
-        logger.info("폴백 재생 완료 | total={s}B", s=len(pcm_data))
 
 
 # ── 전역 플레이어 (stop 접근용) ──────────────────────────
@@ -417,28 +383,7 @@ def speak(text: str) -> None:
     """
     ensure_server()
     resp = synthesize_stream(text)
-    received = _player.play(resp)
-
-    if received == 0:
-        logger.warning("스트리밍 0B 수신 — 비스트리밍 폴백")
-        ref_main, aux_refs = _get_refs()
-        payload = {
-            "text": text,
-            "text_lang": SOVITS_LANG,
-            "ref_audio_path": ref_main,
-            "aux_ref_audio_paths": aux_refs,
-            "prompt_text": SOVITS_REF_TEXT,
-            "prompt_lang": SOVITS_LANG,
-            "text_split_method": "cut0",
-            "batch_size": 1,
-            "media_type": "wav",
-            "streaming_mode": 0,
-        }
-        fb = requests.post(f"{SOVITS_API_URL}/tts", json=payload, timeout=120)
-        if fb.status_code == 200:
-            _player.play_wav(fb.content)
-        else:
-            raise RuntimeError(f"폴백 API 오류 {fb.status_code}: {fb.text[:200]}")
+    _player.play(resp)
 
 
 # ── 단독 테스트 ───────────────────────────────────────────
