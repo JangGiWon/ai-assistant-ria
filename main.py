@@ -215,8 +215,10 @@ def _step_memory_search(text: str) -> str:
 
 
 _META_TAG_PATTERN: re.Pattern = re.compile(
-    r"\[사용자 감정:[^\]]*\]"   # [사용자 감정: 기쁨(0.92) — ...] 형태
-    r"|\[관련 기억\].*?(?=\n\S|\Z)",  # [관련 기억] 블록 (혹시 새어 나오는 경우 대비)
+    r"\[사용자 감정:[^\]]*\]"              # [사용자 감정: 기쁨(0.92) — ...] 형태
+    r"|\[관련 기억\].*?(?=\n\S|\Z)"        # [관련 기억] 블록
+    r"|<channel\|>.*?(?=\n\S|\Z)"          # gemma4 <channel|> 태그 잔여
+    r"|<[a-z_]+\|>",                       # 기타 <xxx|> 형식 태그
     re.DOTALL,
 )
 
@@ -279,6 +281,8 @@ def _step_llm_stream_tts(user_text: str, system_prompt: str) -> Optional[str]:
 
     buf = ""
     full_response = ""
+    _CHANNEL_TAG = "<channel|>"
+    channel_found = False   # gemma4 thinking 모델: <channel|> 이후가 실제 답변
 
     try:
         for token in query_stream(
@@ -286,6 +290,16 @@ def _step_llm_stream_tts(user_text: str, system_prompt: str) -> Optional[str]:
             system=system_prompt,
             history=recent_history,
         ):
+            # <channel|> 태그 탐지 전 — 추론 구간, TTS에 보내지 않음
+            if not channel_found:
+                buf += token
+                if _CHANNEL_TAG in buf:
+                    channel_found = True
+                    buf = buf.split(_CHANNEL_TAG, 1)[1]   # 태그 이후만 유지
+                    full_response = ""
+                    logger.debug("channel 태그 감지 — 실제 답변 시작")
+                continue
+
             buf += token
             full_response += token
 
@@ -296,6 +310,11 @@ def _step_llm_stream_tts(user_text: str, system_prompt: str) -> Optional[str]:
                 if sentence:
                     logger.debug("LLM→TTS 큐 | sentence={s}", s=sentence[:40])
                     tts_queue.put(sentence)
+
+        # <channel|>가 한 번도 안 나온 경우 — 전체를 답변으로 사용
+        if not channel_found:
+            full_response = buf
+            buf = ""
 
         leftover = buf.strip()
         if leftover:

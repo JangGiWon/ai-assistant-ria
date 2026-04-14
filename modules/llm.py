@@ -54,8 +54,9 @@ def query(
         "messages": messages,
         "stream": False,
         "keep_alive": -1,
+        "think": False,
         "options": {
-            "num_predict": 128,
+            "num_predict": 512,
             "num_gpu": 999,
             "num_ctx": 2048,
             "temperature": 0.7,
@@ -115,8 +116,9 @@ def query_stream(
         "messages": messages,
         "stream": True,
         "keep_alive": -1,
+        "think": False,
         "options": {
-            "num_predict": 128,
+            "num_predict": 512,
             "num_gpu": 999,
             "num_ctx": 2048,
             "temperature": 0.7,
