@@ -53,9 +53,15 @@ def query(
         "model": model,
         "messages": messages,
         "stream": False,
+        "keep_alive": -1,
         "options": {
-            "num_gpu": 999,   # 모든 레이어 GPU에 올림
-            "num_ctx": 2048,  # 컨텍스트 축소로 속도 향상
+            "num_predict": 128,
+            "num_gpu": 999,
+            "num_ctx": 2048,
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.8,
+            "repeat_penalty": 1.1,
         },
     }
 
@@ -108,9 +114,15 @@ def query_stream(
         "model": model,
         "messages": messages,
         "stream": True,
+        "keep_alive": -1,
         "options": {
+            "num_predict": 128,
             "num_gpu": 999,
             "num_ctx": 2048,
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.8,
+            "repeat_penalty": 1.1,
         },
     }
 
