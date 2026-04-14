@@ -69,8 +69,14 @@ SOVITS_API_URL: str = os.getenv("SOVITS_API_URL", "http://127.0.0.1:9880")
 SOVITS_REF_AUDIO: Path = Path(os.getenv("SOVITS_REF_AUDIO", str(BASE_DIR / "sound_model" / "ref_3sec.wav")))
 SOVITS_REF_TEXT: str = os.getenv("SOVITS_REF_TEXT", "")
 SOVITS_LANG: str = os.getenv("SOVITS_LANG", "ko")
-SOVITS_GPT_WEIGHTS: str = os.getenv("SOVITS_GPT_WEIGHTS", "GPT_weights_v2Pro/ria-e10.ckpt")
-SOVITS_WEIGHTS: str = os.getenv("SOVITS_WEIGHTS", "SoVITS_weights_v2Pro/ria_e8_s360.pth")
+SOVITS_GPT_WEIGHTS: str = os.getenv(
+    "SOVITS_GPT_WEIGHTS",
+    str(SOVITS_DIR / "GPT_SoVITS" / "pretrained_models" / "gsv-v2final-pretrained" / "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"),
+)
+SOVITS_WEIGHTS: str = os.getenv(
+    "SOVITS_WEIGHTS",
+    str(SOVITS_DIR / "GPT_SoVITS" / "pretrained_models" / "gsv-v2final-pretrained" / "s2G2333k.pth"),
+)
 
 # ── 로그 ──────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG" if not IS_MAC else "INFO")
